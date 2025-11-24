@@ -330,6 +330,9 @@ class DMEngine:
         """
         构建简化版的 world_state，供 DM AI 使用。
         NPC profiles 中移除 roleplay_notes 和 key_information。
+        
+        Returns:
+            Dict[str, Any]: 简化后的 world_state 深拷贝，保持原始 world_state 不变。
         """
         snapshot = deepcopy(self.world_state)
         simplified_profiles: Dict[str, Dict[str, Any]] = {}
