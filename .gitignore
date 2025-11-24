@@ -1,0 +1,4 @@
+stories/**/202*
+uv.lock
+__pycache__
+.vscode

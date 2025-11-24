@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI DM Web 控制台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: 'Segoe UI', 'Noto Sans SC', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: #08090c;
+      color: #f2f4f8;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 16px;
+    }
+    .app-shell {
+      width: min(960px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: #11131a;
+      border: 1px solid #1f2330;
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+    }
+    header {
+      font-size: 1.4rem;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    header span {
+      font-size: 0.9rem;
+      color: #9ba3b4;
+    }
+    .log {
+      flex: 1;
+      min-height: 320px;
+      max-height: 60vh;
+      overflow-y: auto;
+      border: 1px solid #1c2030;
+      border-radius: 12px;
+      padding: 16px;
+      background: #0c0f19;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      scroll-behavior: smooth;
+    }
+    .entry {
+      display: flex;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .entry-label {
+      font-weight: 600;
+      color: #90a4ff;
+      min-width: 64px;
+    }
+    .entry-body {
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+    .entry-player .entry-label { color: #ff9f6a; }
+    .entry-npc .entry-label { color: #a4f098; }
+    .entry-note .entry-label { color: #f5d97c; }
+    .entry-system .entry-label { color: #ff6b81; }
+
+    textarea {
+      width: 100%;
+      min-height: 110px;
+      border-radius: 12px;
+      border: 1px solid #1f2330;
+      padding: 12px;
+      font-size: 1rem;
+      background: #080b15;
+      color: #f2f4f8;
+      resize: vertical;
+    }
+    textarea:focus {
+      outline: 2px solid #4958ff;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 10px 20px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.1s ease, opacity 0.1s ease;
+    }
+    button.primary {
+      background: linear-gradient(120deg, #5c6cff, #8f9fff);
+      color: #060710;
+    }
+    button.secondary {
+      background: transparent;
+      color: #c8cee0;
+      border: 1px solid #2a3045;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button:not(:disabled):active {
+      transform: scale(0.98);
+    }
+    .status {
+      min-height: 24px;
+      font-size: 0.95rem;
+      color: #8c93a8;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header>
+      <div>AI DM Web 控制台</div>
+      <span>按 Enter 发送，Shift+Enter 换行</span>
+    </header>
+    <section id="log" class="log"></section>
+    <section>
+      <textarea id="playerInput" placeholder="描述玩家行动、对白或想做的事情..."></textarea>
+      <div class="controls">
+        <button id="sendBtn" class="primary" type="button">发送</button>
+        <button id="sessionBtn" class="secondary" type="button">开始本次跑团</button>
+        <div id="status" class="status"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      const logEl = document.getElementById('log');
+      const inputEl = document.getElementById('playerInput');
+      const sendBtn = document.getElementById('sendBtn');
+      const sessionBtn = document.getElementById('sessionBtn');
+      const statusEl = document.getElementById('status');
+      let busy = false;
+      let sessionActive = false;
+      let sessionId = null;
+      let history = [];
+      const STORAGE_KEY = 'ai-dnd-session-history:v2';
+      let playerName = '玩家';
+
+      const API_BASE = (() => {
+        if (window.API_BASE_URL) {
+          return window.API_BASE_URL;
+        }
+        const port = window.location.port;
+        if (!port || port === '5000') {
+          return '';
+        }
+        const protocol = window.location.protocol || 'http:';
+        const host = window.location.hostname || 'localhost';
+        return `${protocol}//${host}:5000`;
+      })();
+
+      function apiPath(path) {
+        return API_BASE ? `${API_BASE}${path}` : path;
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text || '';
+      }
+
+      function updateControls() {
+        sendBtn.disabled = busy || !sessionActive;
+        inputEl.disabled = !sessionActive;
+        sessionBtn.disabled = busy;
+        sessionBtn.textContent = sessionActive ? '重置本次跑团' : '开始本次跑团';
+      }
+
+      function setBusy(state, message) {
+        busy = state;
+        if (state && message) {
+          setStatus(message);
+        } else if (!state) {
+          setStatus('');
+        }
+        updateControls();
+      }
+
+      function setSessionActive(flag) {
+        sessionActive = flag;
+        if (!flag) {
+          inputEl.value = '';
+        }
+        updateControls();
+      }
+
+      function clearLogDom() {
+        logEl.innerHTML = '';
+      }
+
+      function renderEntry(entry) {
+        const wrapper = document.createElement('div');
+        wrapper.className = `entry entry-${entry.kind}`;
+        const label = document.createElement('div');
+        label.className = 'entry-label';
+        const labelMap = {
+          dm: 'DM',
+          npc: 'NPC',
+          player: '玩家',
+          note: '备注',
+          system: '系统'
+        };
+        label.textContent = entry.speaker || labelMap[entry.kind] || entry.kind.toUpperCase();
+        const body = document.createElement('div');
+        body.className = 'entry-body';
+        body.textContent = entry.text;
+        wrapper.appendChild(label);
+        wrapper.appendChild(body);
+        logEl.appendChild(wrapper);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function renderHistory() {
+        clearLogDom();
+        history.forEach(renderEntry);
+      }
+
+      function persistHistory() {
+        if (!sessionId || !history.length) {
+          localStorage.removeItem(STORAGE_KEY);
+          return;
+        }
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessionId, history }));
+      }
+
+      function commitHistory() {
+        history.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        renderHistory();
+        persistHistory();
+      }
+
+      function resetHistory() {
+        history = [];
+        commitHistory();
+      }
+
+      function restoreHistory(expectedSessionId) {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) {
+          resetHistory();
+          return false;
+        }
+        try {
+          const saved = JSON.parse(raw);
+          if (saved.sessionId === expectedSessionId && Array.isArray(saved.history)) {
+            history = saved.history.map((entry, idx) => ({
+              kind: entry.kind || 'system',
+              text: entry.text || '',
+              ts: entry.ts ?? (Date.now() + idx),
+              localOnly: Boolean(entry.localOnly),
+              ephemeral: Boolean(entry.ephemeral),
+              speaker: entry.speaker || ''
+            }));
+            commitHistory();
+            return true;
+          }
+        } catch (err) {
+          console.warn('无法解析本地历史记录', err);
+        }
+        localStorage.removeItem(STORAGE_KEY);
+        resetHistory();
+        return false;
+      }
+
+      function defaultSpeaker(kind) {
+        if (kind === 'player') return playerName;
+        if (kind === 'dm') return '旁白';
+        if (kind === 'npc') return '';
+        if (kind === 'note') return '系统';
+        return '系统';
+      }
+
+      function addEntry(kind, text, options = {}) {
+        if (!text) return null;
+        const entry = {
+          kind,
+          text,
+          ts: options.timestamp ?? Date.now(),
+          localOnly: options.localOnly ?? true,
+          ephemeral: options.ephemeral ?? false,
+          speaker: options.speaker || defaultSpeaker(kind)
+        };
+        history.push(entry);
+        commitHistory();
+        return entry;
+      }
+
+      function showError(message) {
+        console.error(message);
+        setStatus(message);
+      }
+
+      function applyServerHistory(entries) {
+        const normalized = (entries || []).map((entry, idx) => ({
+          kind: entry.kind || 'system',
+          text: entry.text || '',
+          ts: entry.timestamp ? entry.timestamp * 1000 : (Date.now() + idx),
+          localOnly: false,
+          ephemeral: false,
+          speaker: entry.speaker || defaultSpeaker(entry.kind)
+        }));
+        const localPersistent = history.filter(item => item.localOnly && !item.ephemeral && item.kind === 'system');
+        history = [...normalized, ...localPersistent];
+        commitHistory();
+      }
+
+      async function fetchJSON(url, options) {
+        const resp = await fetch(url, options);
+        if (!resp.ok) {
+          let detail = '';
+          try {
+            const data = await resp.json();
+            detail = data.error || JSON.stringify(data);
+          } catch (err) {
+            detail = await resp.text();
+          }
+          throw new Error(detail || `HTTP ${resp.status}`);
+        }
+        return resp.json();
+      }
+
+      async function syncHistoryFromServer() {
+        if (!sessionActive || !sessionId) return;
+        try {
+          const data = await fetchJSON(apiPath('/api/session/history'));
+          if (data.session_id && data.session_id === sessionId) {
+            if (data.player_name) {
+              playerName = data.player_name;
+            }
+            applyServerHistory(data.entries || []);
+          }
+        } catch (err) {
+          console.warn('历史同步失败', err);
+        }
+      }
+
+      async function loadSession() {
+        setBusy(true, '同步会话状态...');
+        try {
+          const data = await fetchJSON(apiPath('/api/session'));
+          sessionId = data.session_id || null;
+          if (data.player_name) {
+            playerName = data.player_name;
+          }
+          if (data.initialized) {
+            setSessionActive(true);
+            const restored = restoreHistory(sessionId);
+            if (!restored && data.opening) {
+              addEntry('dm', data.opening, { localOnly: true, ephemeral: true });
+            }
+            await syncHistoryFromServer();
+          } else {
+            sessionId = null;
+            resetHistory();
+            setSessionActive(false);
+            setStatus('会话尚未开始，请点击“开始本次跑团”。');
+          }
+        } catch (err) {
+          showError(`无法加载会话：${err.message}`);
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function startOrResetSession() {
+        if (busy) return;
+        const isReset = sessionActive;
+        setBusy(true, isReset ? '重置中...' : '启动剧本...');
+        try {
+          const endpoint = isReset ? '/api/reset' : '/api/session/start';
+          const data = await fetchJSON(apiPath(endpoint), { method: 'POST' });
+          sessionId = data.session_id || null;
+          if (data.player_name) {
+            playerName = data.player_name;
+          }
+          setSessionActive(true);
+          resetHistory();
+          if (data.opening) {
+            addEntry('dm', data.opening, { localOnly: true, ephemeral: true });
+          }
+          setStatus(isReset ? '已重置本次跑团' : '新的跑团已经开始');
+          await syncHistoryFromServer();
+        } catch (err) {
+          showError(`启动/重置失败：${err.message}`);
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function sendTurn() {
+        const text = inputEl.value.trim();
+        if (!text || busy || !sessionActive) return;
+        addEntry('player', text, { localOnly: true, ephemeral: true, speaker: playerName });
+        inputEl.value = '';
+        setBusy(true, '等待 DM...');
+        try {
+          const data = await fetchJSON(apiPath('/api/turn'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player_text: text })
+          });
+          if (data.player_name) {
+            playerName = data.player_name;
+          }
+          if (data.narration) {
+            addEntry('dm', data.narration, { localOnly: true, ephemeral: true, speaker: '旁白' });
+          }
+          (data.npc_lines || []).forEach((info) => {
+            if (!info) return;
+            if (typeof info === 'string') {
+              addEntry('npc', info, { localOnly: true, ephemeral: true });
+            } else {
+              addEntry('npc', info.text, { localOnly: true, ephemeral: true, speaker: info.speaker || '' });
+            }
+          });
+          (data.debug_events || []).forEach(ev => {
+            console.info(`[调试] ${ev.text || ev.type}`);
+          });
+          await syncHistoryFromServer();
+        } catch (err) {
+          showError(`回合处理失败：${err.message}`);
+          await syncHistoryFromServer();
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      sendBtn.addEventListener('click', sendTurn);
+      sessionBtn.addEventListener('click', startOrResetSession);
+      inputEl.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          sendTurn();
+        }
+      });
+
+      loadSession();
+    })();
+  </script>
+</body>
+</html>

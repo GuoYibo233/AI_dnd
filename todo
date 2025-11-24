@@ -1,0 +1,484 @@
+
+## 0. 架构图
+
+```mermaid
+flowchart LR
+    UI[Player UI<br/>人类 PL 输入/输出]
+    DM[DM AI<br/>世界&叙事控制]
+    DIS[发言调度器<br/>Turn & Speech Dispatcher]
+    WORLD[世界状态存储<br/>真相视角]
+    MEMS[角色记忆/视角<br/>私有视角]
+    AGENTS[NPC / AI PL 控制器<br/>多角色控制]
+    LLM[(LLM 后端<br/>共享模型)]
+
+    UI --> DIS
+    UI --> DM
+
+    DM <--> WORLD
+    DM --> DIS
+    DM --> MEMS
+
+    DIS --> AGENTS
+    AGENTS --> DIS
+
+    AGENTS <--> MEMS
+    MEMS <--> LLM
+
+    DIS --> UI
+```
+
+---
+
+## 1. 整体目标与核心理念
+
+### 1.1 目标
+
+* 做一个 **沙盒式 AI 跑团引擎 Demo**：
+
+  * 只有初始设定 + 若干 NPC 倾向/目标
+  * 无固定主线、无预定结局
+  * 故事由 **玩家行为 + NPC 动机 + DM 合理化** 自然演化
+* 剧情可大幅偏离“勇者打魔王”的传统剧本，只要 **在世界观内合理** 即可。
+
+### 1.2 核心设计理念
+
+1. **叙事 / 世界模拟 为主，战斗系统之后接入**
+2. **多智能体 + 严格视角隔离**
+
+   * 每个角色 AI 只看到自己的视角 +公开信息
+   * 卧底、阴谋、秘密都通过“私有记忆”+“不共享上下文”实现
+3. **DM AI = 叙事物理引擎**
+
+   * 不写死主线
+   * 负责解释因果、维护合理性、推动世界变化
+4. **发言调度器 = 噪声控制 + Spotlight 分配**
+
+   * 解决“谁该说话、谁闭嘴”的问题
+   * 保证不会变成一群 AI 同时出声的文字洪水
+
+---
+
+## 2. 模块划分（MVP 版）
+
+先做一个最小可跑 Demo 的版本，建议模块如下：
+
+1. Player UI（人类玩家界面）
+2. 世界状态存储（World State Store）
+3. 角色记忆与视角（Agent Memories）
+4. DM AI（世界 & 剧情控制）
+5. NPC / AI PL 控制器（Agent Controller）
+6. 发言调度模块（Turn & Speech Dispatcher）
+7. LLM 后端（一个或几个模型实例）
+
+### 2.1 Player UI
+
+* 功能：
+
+  * 显示 DM / NPC / 队友发言
+  * 接收人类 PL 的自然语言输入（“我对铁匠说：帮我修武器”）
+* 对后端只需要一个接口：
+
+  * `send_player_utterance(text)` → 返回新一轮系统输出（多条发言按顺序）。
+
+---
+
+### 2.2 世界状态存储（World State Store）
+
+* 视角：**上帝视角真相**（只有 DM 和系统看得到）
+* 内容示例：
+
+  * 时间、地点、天气
+  * 所有 NPC / PL 的真实位置、状态
+  * 队伍的物品、任务、关系
+  * 重要事件记录（日志）
+* 可以用简单的 Python 对象或一个 `world_state.json`，比如：
+
+```json
+{
+  "time": "day 3, evening",
+  "location": "village_square",
+  "global_flags": {
+    "demon_king_alive": true,
+    "village_under_threat": true
+  },
+  "characters": {
+    "hero": {
+      "location": "village_square",
+      "hp": 20,
+      "known_facts": ["村庄遭受魔物袭击"],
+      "inventory": ["rusty_sword"]
+    },
+    "blacksmith": {
+      "location": "forge",
+      "disposition_to_hero": 50
+    }
+  },
+  "log": [
+    {"type": "event", "who": "hero", "what": "arrived_village", "turn": 1}
+  ]
+}
+```
+
+---
+
+### 2.3 角色记忆与视角（Agent Memories）
+
+* 每个角色有一份“私有视角”：
+
+  * 从世界真相中投影 + 私有信息（秘密、阴谋、心结）
+* 用于构造调用 LLM 时的 prompt：
+
+组成：
+
+1. 角色基础设定（from world.json / npc.json）
+2. 私有信息（卧底身份、个人目标）
+3. 从世界状态中筛出来的“该角色知道的事实”
+4. 记忆库（过往事件摘要），可简单实现为最近 N 条 + 人工摘要
+
+示例：NPC JSON 结构（初始数据）
+
+```json
+{
+  "id": "blacksmith",
+  "name": "多恩",
+  "role": "铁匠",
+  "base_traits": {
+    "loyalty": 60,
+    "greed": 20,
+    "bravery": 50,
+    "talkative": 30
+  },
+  "goals": [
+    "保护村庄安全",
+    "赚足够的钱给女儿治病"
+  ],
+  "secrets": [
+    "曾经为魔王军打造过武器",
+    "害怕这件事被村民知道"
+  ],
+  "relationships": {
+    "hero": {
+      "trust": 40,
+      "respect": 30
+    }
+  },
+  "knowledge": [
+    "知道魔王军最近活动在北方森林",
+    "知道神圣宝剑的传闻"
+  ]
+}
+```
+
+每次 NPC 说话前，从：
+
+* `base_traits`
+* `current_state`（动态属性）
+* `knowledge` 的子集
+* `最近相关记忆`
+
+拼出一个“视角 prompt”。
+
+---
+
+### 2.4 DM AI（世界 & 故事控制）
+
+DM AI 的职责：
+
+1. 解析玩家输入（意图理解）：
+
+   * 这句话是：询问 / 行动 / 威胁 / 求助 / 纯聊天？
+2. 依据世界状态 + NPC 倾向，决定世界如何响应：
+
+   * 更新世界状态（位置、好感度、flag）
+   * 生成若干“高层事件描述”
+3. 决定接下来大致要发生什么：
+
+   * 环境描述？
+   * 让哪个 NPC 说话？
+   * 是否抛出新线索？
+   * 是否触发危机 / 冲突？
+4. 把“要说的话 / 要做的事”分派给：
+
+   * 发言调度器（决定谁发言）
+   * NPC 控制器（生成具体对话）
+
+可以把 DM 看成一层“逻辑控制 + 因果推导”：
+
+输入：
+
+* 玩家这一步的自然语言指令
+* 当前世界状态
+* 日志中最近若干事件
+
+输出：
+
+* 更新后的世界状态
+* “可能发言人物列表 + 含义”
+* 一个 DM 自己的发言（比如场景叙述/转场）
+
+---
+
+### 2.5 NPC / AI PL 控制器（Agent Controller）
+
+* 每个重要 NPC / AI PL 都有一个控制函数：
+
+输入：
+
+* 当前公共场景信息（本回合公开信息概要）
+* 该角色视角（私有记忆 + 动机 + 情绪）
+* DM 给他的“任务指令”（比如：去试探性地问玩家是否愿意帮忙）
+
+输出：
+
+* 该角色说的一段话（公开）
+* 以及可选的“内心独白”（可不展示，只用于后续决策）
+
+示例：“任务指令”形式：
+
+```json
+{
+  "intent": "talk_to_player",
+  "style": "谨慎但焦急",
+  "goal": "试探玩家是否愿意帮助防御魔物",
+  "constraints": [
+    "不要提起自己曾为魔王打造武器的秘密"
+  ]
+}
+```
+
+LLM prompt 里就把：
+
+* 人设
+* 视角
+* 当前场景
+* 任务指令
+  拼成“系统 + 用户”信息。
+
+---
+
+### 2.6 发言调度模块（Turn & Speech Dispatcher）
+
+这是你非常重视的部分，也是这个系统的关键。
+
+职责：
+**在每一轮交互中，决定：谁发言、发言顺序、发言数量。**
+
+核心思想：
+
+* 每个角色每回合都有一个 `speak_score`，根据规则计算。
+* 决定：
+
+  * 必须发言（score 很高，或者被点名）
+  * 可选发言（score 中等，可能插一句）
+  * 不发言（score 很低）
+
+**一个简单的 score 设计（可作为 Demo 用）**：
+
+对每个角色 `C`：
+
+```text
+score(C) =
+  w1 * is_directly_addressed(C)   // 被点名/被问 = 1，否则 0
++ w2 * relevance_to_event(C)      // 事件与其目标/动机相关度，0~1
++ w3 * time_since_last_speak(C)   // 越久没说话，分越高
++ w4 * personality_talkative(C)   // 健谈/寡言
++ w5 * spotlight_need(C)          // DM 想给的spotlight，特定轮设置为正
+```
+
+一个 Demo 级伪流程：
+
+```python
+def dispatch_speakers(characters, context, dm_recommendations):
+    # 1. 先从dm推荐中拿到“必须发言列表”（例如：被玩家直接交互、DM点名）
+    must_speak = set(dm_recommendations["must_speak_ids"])
+
+    # 2. 计算所有角色 speak_score
+    scores = {}
+    for c in characters:
+        scores[c.id] = compute_speak_score(c, context, dm_recommendations)
+
+    # 3. 必须发言 + 从剩余里选几位可选发言
+    sorted_chars = sorted(
+        [c for c in characters if c.id not in must_speak],
+        key=lambda c: scores[c.id],
+        reverse=True
+    )
+
+    optional = []
+    for c in sorted_chars:
+        if scores[c.id] < THRESHOLD_OPTIONAL:
+            break
+        optional.append(c.id)
+        if len(optional) >= MAX_OPTIONAL_PER_TURN:
+            break
+
+    return list(must_speak) + optional
+```
+
+注意：
+
+* 人类玩家已经“发言完成”，这一轮只管 AI 角色
+* `MAX_OPTIONAL_PER_TURN` 例如设置为 1~2，避免噪声
+* DM 可通过 `dm_recommendations` 对某个角色临时加 spotlight
+
+---
+
+### 2.7 LLM 后端
+
+* 可以只用一个模型（例如一个可思考的大模型），用不同 system prompt 扮演不同角色。
+* 也可以做成：
+
+  * DM、意图解析、叙事 → 高质量模型
+  * NPC 小对话 / 简单回复 → 便宜模型
+
+Demo 阶段建议简单一点：**一个模型 + 不同 prompt**。
+
+---
+
+## 3. 世界 JSON 结构（Demo 级）
+
+你当前设想：
+
+* JSON 里不存完整剧本
+* 只存一个故事开头 + 一堆有倾向的 NPC
+
+可以用类似结构：
+
+```json
+{
+  "world_meta": {
+    "title": "勇者与魔王的世界",
+    "opening_text": "你是一名刚到边境小村庄的冒险者……",
+    "initial_location": "village_square"
+  },
+  "locations": {
+    "village_square": {
+      "name": "村庄广场",
+      "description": "破旧的石板路和熙攘的摊位……",
+      "npcs": ["blacksmith", "priest"],
+      "tags": ["starting_area"]
+    },
+    "demon_castle": {
+      "name": "魔王城",
+      "description": "远处黑云盘旋的高塔……",
+      "npcs": ["demon_king"],
+      "tags": ["endgame"]
+    }
+  },
+  "npcs": {
+    "blacksmith": { ... },
+    "priest": { ... },
+    "demon_king": { ... }
+  }
+}
+```
+
+---
+
+## 4. 单回合主循环（Demo 伪代码）
+
+把所有东西串起来，给你一个“从玩家说话到系统返回”的完整流程。
+
+```python
+def process_turn(player_text, world_state, memories, dm_state):
+    # 1. 记录玩家发言到世界log
+    world_state.log.append({"type": "player_say", "who": "hero", "text": player_text})
+
+    # 2. DM 解析玩家发言 & 世界更新
+    dm_input = {
+        "player_text": player_text,
+        "world_state": world_state.snapshot(),  # 上帝视角快照
+        "recent_log": world_state.get_recent_events()
+    }
+
+    dm_output = call_dm_ai(dm_input)
+    # dm_output 包含：
+    # - updated_world_diff
+    # - dm_utterance (可选，DM叙述)
+    # - dm_recommendations: { "must_speak_ids": [...], "spotlight_ids": [...] }
+
+    world_state.apply_diff(dm_output["updated_world_diff"])
+
+    all_utterances = []
+
+    # 2.1 如果 DM 有叙述性发言，先加入
+    if dm_output.get("dm_utterance"):
+        all_utterances.append({"who": "DM", "text": dm_output["dm_utterance"]})
+
+    # 3. 发言调度：决定哪些角色发言（AI 队友 + NPC）
+    characters = get_all_ai_characters_in_scene(world_state)
+    speaker_ids = dispatch_speakers(
+        characters,
+        context={"world_state": world_state, "player_text": player_text},
+        dm_recommendations=dm_output["dm_recommendations"]
+    )
+
+    # 4. 对每个 speaker 调用其控制器生成发言
+    for cid in speaker_ids:
+        char = get_character(cid)
+        view = build_character_view(char, world_state, memories[cid])
+        task = build_character_task_from_dm(cid, dm_output["dm_recommendations"])
+        utterance_text, internal_state_diff = call_character_ai(view, task)
+
+        all_utterances.append({"who": char.name, "text": utterance_text})
+        memories[cid].apply_internal_diff(internal_state_diff)
+        world_state.log.append({"type": "char_say", "who": cid, "text": utterance_text})
+
+    # 5. 返回这一轮需要展示给玩家的所有发言
+    return all_utterances, world_state, memories, dm_state
+```
+
+你可以先不实现 `internal_state_diff`，只实现“说话 + 简单记日志”的版本。
+
+---
+
+## 5. Demo 范围建议
+
+针对第一版 Demo（只要能跑起来）：
+
+1. 1 名人类 PL + 1~2 个重要 NPC + 1 个 AI 队友（可选）
+2. 不做战斗系统，只做：
+
+   * 场景描述
+   * 简单社交互动
+   * NPC 根据各自目标向玩家发出请求/线索
+3. 世界很小：
+
+   * 一个村庄
+   * 一个铁匠
+   * 一个牧师
+   * 远处的魔王城（只在对话中被提起）
+4. DM 只做：
+
+   * 解析玩家意图（探索/问话/威胁/拒绝）
+   * 更新简单 flag（比如：村民是否信任你）
+   * 决定哪个 NPC 出来讲话
+   * 做场景转场/节奏控制（比如从广场到教堂）
+
+等这套 Demo 跑顺畅，再加：
+
+* 更多地点
+* 更多 NPC
+* 检定/简单战斗
+* 更复杂的情绪/动机系统
+
+---
+
+
+1、目前直接出旁白体验不好--前端优化
+2、目前的输入需要支持语音输入
+3、API输出不是流式输出
+4、返回文字太多了，接一个TTS会体验好很多 elevenlabs/豆包
+5、前端体验&交互有待优化，每次回复的时候刷一下
+6、故事的初始设定怎么更合理？生成文字的风格
+
+修建世界状态优化传参，NPC传对话log：
+  我需要你把这个world_state作为一个实例，并且准备给这个实例写上若干个函数，我希望所有的信息传递都围绕这个world_state展开，改变以前混乱的格式。
+  1. 把world_state搞成一个实例
+  2. 可能需要为了不同的AI生成出不同的state简化版
+  对于
+继续优化prompt
+让 DM 管理场景移动 NO 让专门的 AI 处理world_state，包括场景切换
+优化旁白输出
+优化NPC结构，NPC创造，加载逻辑
+增加对话机制，每次对话初始化状态，每次对话结束整理状态，增加状态管理AI
