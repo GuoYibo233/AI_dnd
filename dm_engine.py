@@ -326,6 +326,24 @@ class DMEngine:
 
     # ------------------------------------------------------------------
     # Prompt 构建（DM = 管理者，不写文案）
+    def _build_simplified_world_state(self) -> Dict[str, Any]:
+        """
+        构建简化版的 world_state，供 DM AI 使用。
+        NPC profiles 中移除 roleplay_notes 和 key_information。
+        """
+        snapshot = deepcopy(self.world_state)
+        simplified_profiles: Dict[str, Dict[str, Any]] = {}
+        for npc_id, profile in snapshot.get("npc_profiles", {}).items():
+            if not isinstance(profile, dict):
+                continue
+            simplified_profiles[npc_id] = {
+                key: value
+                for key, value in profile.items()
+                if key not in {"roleplay_notes", "key_information"}
+            }
+        snapshot["npc_profiles"] = simplified_profiles
+        return snapshot
+
     def _build_dm_messages(self, player_text: str) -> tuple[List[Dict[str, str]], str, Dict[str, Any]]:
         world_meta = self.story_seed["world_meta"]
         location_block = self.story_seed["locations"].get(self.current_location, {})
@@ -492,9 +510,13 @@ class DMEngine:
             """
         ).strip()
 
+        # 构建简化的 world_state 提供给 DM AI
+        simplified_world_state = self._build_simplified_world_state()
+
         user_prompt = {
             "turn_index": self.turn_counter,
             "world_meta": world_meta,
+            "world_state": simplified_world_state,
             "players": players_brief,
             "current_location": {
                 "id": self.current_location,
